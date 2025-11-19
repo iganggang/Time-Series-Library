@@ -6,8 +6,8 @@ import os
 import torch
 from torch import nn
 
-from src.models.patchTST import PatchTST
-from src.learner import Learner, transfer_weights
+from models.patchtst_ssl.backbone import PatchTSTBackbone
+from src.learner import Learner, get_model as unwrap_model
 from src.callback.tracking import *
 from src.callback.patch_mask import *
 from src.callback.transforms import *
@@ -61,32 +61,46 @@ if not os.path.exists(args.save_path): os.makedirs(args.save_path)
 set_device()
 
 
-def get_model(c_in, args):
-    """
-    c_in: number of variables
-    """
-    # get number of patches
-    num_patch = (max(args.context_points, args.patch_len)-args.patch_len) // args.stride + 1    
-    print('number of patches:', num_patch)
-    
-    # get model
-    model = PatchTST(c_in=c_in,
-                target_dim=args.target_points,
-                patch_len=args.patch_len,
-                stride=args.stride,
-                num_patch=num_patch,
-                n_layers=args.n_layers,
-                n_heads=args.n_heads,
-                d_model=args.d_model,
-                shared_embedding=True,
-                d_ff=args.d_ff,                        
-                dropout=args.dropout,
-                head_dropout=args.head_dropout,
-                act='relu',
-                head_type='pretrain',
-                res_attention=False
-                )        
-    # print out the model size
+class MaskedPatchTST(nn.Module):
+    def __init__(self, c_in: int, args):
+        super().__init__()
+        self.backbone = PatchTSTBackbone(
+            n_vars=c_in,
+            seq_len=args.context_points,
+            patch_len=args.patch_len,
+            stride=args.stride,
+            n_layers=args.n_layers,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            d_ff=args.d_ff,
+            dropout=args.dropout,
+            attn_dropout=args.dropout,
+            act='relu',
+            revin=bool(args.revin),
+        )
+        self.head = PretrainHead(self.backbone.d_model, args.patch_len, args.head_dropout)
+
+    def forward(self, x):
+        latent = self.backbone(x)
+        preds = self.head(latent)
+        return preds, self.backbone.aux_loss
+
+
+class PretrainHead(nn.Module):
+    def __init__(self, d_model: int, patch_len: int, dropout: float) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.linear = nn.Linear(d_model, patch_len)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        x = latent.transpose(2, 3)
+        x = self.linear(self.dropout(x))
+        x = x.permute(0, 2, 1, 3)
+        return x
+
+
+def build_model(c_in, args):
+    model = MaskedPatchTST(c_in=c_in, args=args)
     print('number of model params', sum(p.numel() for p in model.parameters() if p.requires_grad))
     return model
 
@@ -94,7 +108,7 @@ def get_model(c_in, args):
 def find_lr():
     # get dataloader
     dls = get_dls(args)    
-    model = get_model(dls.vars, args)
+    model = build_model(dls.vars, args)
     # get loss
     loss_func = nn.HuberLoss()
     # get callbacks
@@ -118,7 +132,7 @@ def pretrain_func(lr=args.lr):
     # get dataloader
     dls = get_dls(args)
     # get model     
-    model = get_model(dls.vars, args)
+    model = build_model(dls.vars, args)
     # get loss
     loss_func = nn.HuberLoss()
     # get callbacks
@@ -143,6 +157,13 @@ def pretrain_func(lr=args.lr):
     valid_loss = learn.recorder['valid_loss']
     df = pd.DataFrame(data={'train_loss': train_loss, 'valid_loss': valid_loss})
     df.to_csv(args.save_path + args.save_pretrained_model + '_losses.csv', float_format='%.6f', index=False)
+    save_backbone_checkpoint(learn, os.path.join(args.save_path, args.save_pretrained_model + '_backbone.pth'))
+
+
+def save_backbone_checkpoint(learner: Learner, path: str) -> None:
+    state = {'backbone_state_dict': unwrap_model(learner.model).backbone.state_dict()}
+    torch.save(state, path)
+    print(f'saved backbone checkpoint to {path}')
 
 
 if __name__ == '__main__':
