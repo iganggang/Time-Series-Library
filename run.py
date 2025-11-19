@@ -139,6 +139,9 @@ if __name__ == '__main__':
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
+    parser.add_argument('--patch_stride', type=int, default=None, help='stride between adjacent patches for PatchTST-style models')
+    parser.add_argument('--pretrained_model', type=str, default=None, help='path to an SSL-pretrained PatchTST backbone')
+    parser.add_argument('--freeze_backbone', action='store_true', help='freeze the pretrained backbone during finetuning', default=False)
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:
